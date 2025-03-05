@@ -1,3 +1,25 @@
+# DeepGEMM (DW)
+This is an extension of DeepGEMM for backward pass in MoE traning.
+
+## Why Extend the Original Kernel?
+Let the input of the MoE block be denoted as `X`, and the weights as `W`, where `X` has shape `[m_sum, K]`, and `W` has shape `[g, N, K]`.
+
+- In the forward pass, each expert receives a different number of tokens `[m1, m2, m3 ...]`, with the total denoted as `m_sum`. This means that, from the per-expert perspective, the M dimension in the matrix multiplication varies.
+- Now, let's consider the backward pass. The gradients of the MoE block follow these computation patterns:
+    - `dx = dy @ W.T`, where `dy` has shape `[m_sum, N]` and `W.T` has shape `[g, N, K]`. We can easily reuse the original kernel to compute `dx`, which has shape `[m_sum, K]`.
+    - `dw = x.T @ dy`, where `x.T` has shape `[K, m_sum]`. Now, the reduction dimension in each matrix multiplication becomes the varying dimension (corresponding to `m_sum`), making it impossible to reuse the original kernel, which requires `SHAPE_K` to be constant. Therefore, I have extended the computation specifically for `dw`.
+
+## Content
+All content is located in [`deep_gemm/jit_kernels/k_grouped_gemm_dw.py`](./deep_gemm/jit_kernels/k_grouped_gemm_dw.py) and [`deep_gemm/include/deep_gemm/fp8_gemm_dw.cuh`](./deep_gemm/include/deep_gemm/fp8_gemm_dw.cuh).
+
+Run the command below to execute tests/benchmarks:
+```
+python -m deep_gemm.jit_kernels.k_grouped_gemm_dw
+```
+
+---
+
+
 # DeepGEMM
 
 DeepGEMM is a library designed for clean and efficient FP8 General Matrix Multiplications (GEMMs) with fine-grained scaling, as proposed in [DeepSeek-V3](https://github.com/deepseek-ai/DeepSeek-V3). It supports both normal and Mix-of-Experts (MoE) grouped GEMMs. Written in CUDA, the library has no compilation need during installation, by compiling all kernels at runtime using a lightweight Just-In-Time (JIT) module.
