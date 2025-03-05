@@ -249,7 +249,7 @@ fp8_gemm_kernel_dw(__nv_bfloat16* gmem_d, float* scales_b, int* grouped_layout,
     constexpr int kNumMathRegisters = 232;
 
     // Block scheduler
-    uint32_t m_block_idx, n_block_idx, curr_k_dim_size;
+    uint32_t m_block_idx, n_block_idx, curr_k_dim_size, num_iterations_cumsum{};
     auto scheduler = SchedulerDW<kGemmType, SHAPE_M, SHAPE_N, BLOCK_M, BLOCK_N, kNumGroups, kNumTMAMulticast>(grouped_layout);
 
     // if(threadIdx.x == 0){
@@ -264,17 +264,13 @@ fp8_gemm_kernel_dw(__nv_bfloat16* gmem_d, float* scales_b, int* grouped_layout,
         if (threadIdx.x == kNumMathThreads) {
             // Persistently schedule over blocks
             while (scheduler.get_next_block(m_block_idx, n_block_idx, curr_k_dim_size)) {
-                // if(blockIdx.x == 0) {
-                //     printf("block_idx: %d, block_mnk: [%d, %d, %d]\n", blockIdx.x, m_block_idx, n_block_idx, curr_k_dim_size);
-                // }
-
+                auto num_iterations = ceil_div(curr_k_dim_size, kFullKOfAllStages);
                 launch_k_iterations(curr_k_dim_size, [&](int k_iter, auto type) {
-                    auto num_iterations = ceil_div(curr_k_dim_size, kFullKOfAllStages);
                     if constexpr (std::is_same_v<decltype(type), DivisibleK>){
                         #pragma unroll
                         for (uint32_t s = 0; s < kNumStages; ++ s) {
                             // Wait consumer release
-                            empty_barriers[s]->wait((scheduler.current_iter * num_iterations + k_iter + 1) & 1);
+                            empty_barriers[s]->wait((num_iterations_cumsum + k_iter + 1) & 1);
 
                             // Issue TMA A with broadcasting
                             auto& full_barrier = *full_barriers[s];
@@ -298,9 +294,7 @@ fp8_gemm_kernel_dw(__nv_bfloat16* gmem_d, float* scales_b, int* grouped_layout,
                         auto residual_stages = ceil_div((curr_k_dim_size % kFullKOfAllStages), BLOCK_K);
                         for (uint32_t s = 0; s < residual_stages; ++ s) {
                             // Wait consumer release
-                            empty_barriers[s]->wait((scheduler.current_iter * num_iterations + k_iter + 1) & 1);
-
-                            // TODO: masked-loading to handle residual K
+                            empty_barriers[s]->wait((num_iterations_cumsum + k_iter + 1) & 1);
 
                             // Issue TMA A with broadcasting
                             auto& full_barrier = *full_barriers[s];
@@ -323,19 +317,20 @@ fp8_gemm_kernel_dw(__nv_bfloat16* gmem_d, float* scales_b, int* grouped_layout,
 
                         // Wait unaligned cases
                         for (uint32_t s = residual_stages; s < kNumStages; ++ s) {
-                            empty_barriers[s]->wait((scheduler.current_iter * num_iterations + k_iter + 1) & 1);
+                            empty_barriers[s]->wait((num_iterations_cumsum + k_iter + 1) & 1);
                             full_barriers[s]->arrive();
                         }
                     }
                 });
+                num_iterations_cumsum += num_iterations;
             }
 
-            // // To safely deconstruct distributed shared barriers, we need another round of empty waits
-            // if constexpr (kNumTMAMulticast > 1) {
-            //     #pragma unroll
-            //     for (uint32_t s = 0; s < kNumStages; ++ s)
-            //         empty_barriers[s]->wait((scheduler.current_iter * num_iterations + 1) & 1);
-            // }
+            // To safely deconstruct distributed shared barriers, we need another round of empty waits
+            if constexpr (kNumTMAMulticast > 1) {
+                #pragma unroll
+                for (uint32_t s = 0; s < kNumStages; ++ s)
+                    empty_barriers[s]->wait((num_iterations_cumsum + 1) & 1);
+            }
         }
     } else {
         // Math warp-groups for WGMMA
@@ -347,17 +342,6 @@ fp8_gemm_kernel_dw(__nv_bfloat16* gmem_d, float* scales_b, int* grouped_layout,
 
         // Persistently schedule over blocks
         while (scheduler.get_next_block(m_block_idx, n_block_idx, curr_k_dim_size)) {
-            // if(blockIdx.x == 0 && threadIdx.x == 0) {
-            //     printf(
-            //         "block_idx: %d, block_mnk: [%d, %d, %d]; %d\n",
-            //         blockIdx.x,
-            //         m_block_idx,
-            //         n_block_idx,
-            //         curr_k_dim_size,
-            //         32*m_block_idx+n_block_idx
-            //     );
-            // }
-
             // Decide the number of scales B to load
             DG_STATIC_ASSERT(SHAPE_N % 8 == 0, "Invalid shape N");
             uint32_t num_former_iters = BLOCK_N / 8, num_full_iters = num_former_iters;
@@ -365,9 +349,7 @@ fp8_gemm_kernel_dw(__nv_bfloat16* gmem_d, float* scales_b, int* grouped_layout,
                 num_former_iters = min(BLOCK_N, BLOCK_K - n_block_idx * BLOCK_N % BLOCK_K) / 8;
                 num_full_iters = min(SHAPE_N - n_block_idx * BLOCK_N, BLOCK_N) / 8;
             }
-            // auto num_previous_lines = scheduler.get_global_idx<false>(ceil_div(SHAPE_N, BLOCK_K), 0, 0, m_block_idx);
-            auto num_previous_lines = scheduler.curr_cumsum / BLOCK_K + m_block_idx * ceil_div(SHAPE_N, BLOCK_K);
-            const auto* local_scale_b = scales_b + (num_previous_lines + ((n_block_idx * BLOCK_N) / BLOCK_K)) * SHAPE_K_SCALES;
+            const auto* local_scale_b = scales_b + (n_block_idx * BLOCK_N / BLOCK_K) * SHAPE_K_SCALES + scheduler.curr_cumsum / BLOCK_K;
 
             // Accumulation for WGMMA or CUDA promotion
             float accum[WGMMA::kNumAccum], final_accum[WGMMA::kNumAccum] = {0};
@@ -382,8 +364,8 @@ fp8_gemm_kernel_dw(__nv_bfloat16* gmem_d, float* scales_b, int* grouped_layout,
             };
 
             // Launch MMAs
+            auto num_iterations = ceil_div(curr_k_dim_size, kFullKOfAllStages);
             launch_k_iterations(curr_k_dim_size, [&](int k_iter, auto type) {
-                auto num_iterations = ceil_div(curr_k_dim_size, kFullKOfAllStages);
                 if constexpr (std::is_same_v<decltype(type), DivisibleK>) {
                     #pragma unroll
                     for (int s = 0; s < kNumStages; ++ s) {
@@ -394,7 +376,7 @@ fp8_gemm_kernel_dw(__nv_bfloat16* gmem_d, float* scales_b, int* grouped_layout,
                             scale_b_1 = ld_shared(local_scale_b + k_iter * kNumStages + s + SHAPE_K_SCALES);
 
                         // Wait TMA arrivals
-                        full_barriers[s]->wait((scheduler.current_iter * num_iterations + k_iter) & 1);
+                        full_barriers[s]->wait((num_iterations_cumsum + k_iter) & 1);
 
                         // Read A scales
                         // NOTES: all shared memory read must be prior to `warpgroup_arrive` to avoid next scheduled block polluting the results
@@ -451,7 +433,7 @@ fp8_gemm_kernel_dw(__nv_bfloat16* gmem_d, float* scales_b, int* grouped_layout,
 
 
                         // Wait TMA arrivals
-                        full_barriers[s]->wait((scheduler.current_iter * num_iterations + k_iter) & 1);
+                        full_barriers[s]->wait((num_iterations_cumsum + k_iter) & 1);
 
                         // Read A scales
                         // NOTES: all shared memory read must be prior to `warpgroup_arrive` to avoid next scheduled block polluting the results
@@ -494,11 +476,12 @@ fp8_gemm_kernel_dw(__nv_bfloat16* gmem_d, float* scales_b, int* grouped_layout,
 
                     // Wait unaligned cases
                     for (uint32_t s = residual_stages; s < kNumStages; ++ s) {
-                        full_barriers[s]->wait((scheduler.current_iter * num_iterations + k_iter) & 1);
+                        full_barriers[s]->wait((num_iterations_cumsum + k_iter) & 1);
                         empty_barrier_arrive(s);
                     }
                 }
             });
+            num_iterations_cumsum += num_iterations;
 
             // Write back to shared memory using STSM
             DG_STATIC_ASSERT(WGMMA::kNumAccum % 4 == 0, "Invalid STSM x2 vectorization");
@@ -608,17 +591,6 @@ public:
                                 CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_NONE);
     }
 
-    // template <typename T>
-    // static CUtensorMap make_3d_tma_d_desc(T* global_address) {
-    //     return make_3d_tma_desc(global_address, Layout::RowMajor,
-    //                             kNumGroups, SHAPE_M, SHAPE_N,
-    //                             BLOCK_M, BLOCK_N,
-    //                             CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_NONE);
-    //     uint64_t gmem_dim[3] = {SHAPE_N, SHAPE_M, kNumGroups};
-    //     uint32_t smem_dim[2] = {BLOCK_N, BLOCK_M};
-    //     return make_2d_tma_copy_desc(global_address, gmem_dim, gmem_cols * sizeof(T), smem_dim, swizzle_type);
-    // }
-
     template <typename T>
     static CUtensorMap make_2d_tma_scales_a_desc(T* global_address, uint32_t shape_k) {
         // Make TMA aligned to 16 bytes
@@ -626,7 +598,8 @@ public:
         auto shape_m = ceil_div(SHAPE_M, kAlignment) * kAlignment;
 
         return make_2d_tma_desc(global_address, Layout::ColMajor,
-                                shape_m, ceil_div(shape_k, BLOCK_K), BLOCK_M, 1,
+                                shape_m, shape_k / BLOCK_K,
+                                BLOCK_M, 1,
                                 CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_NONE);
     }
 

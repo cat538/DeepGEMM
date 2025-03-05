@@ -2,7 +2,6 @@ import os
 import torch
 from typing import Tuple
 
-# from .gemm import get_best_configs
 from .tuner import jit_tuner
 from .utils import get_col_major_tma_aligned_tensor, get_num_sms
 
@@ -90,8 +89,8 @@ def get_best_configs(m: int, n: int, k: int, num_groups: int, num_sms: int,
                 best_util = get_last_wave_util(best_block_m, best_block_n)
                 success = util > best_util or (util == best_util and (block_m > best_block_m or (block_m == best_block_m and block_n < best_block_n)))
             best_block_m, best_block_n = (block_m, block_n) if success else (best_block_m, best_block_n)
-            if success and os.environ.get("DG_DW_DEBUG", None) is not None:
-                print(f"BM, BN: [{block_m}, {block_n}]; num_waves: {num_waves}; last_wave_util: {get_last_wave_util(block_m, block_n)}%")
+            # if success and os.environ.get("DG_DW_DEBUG", None) is not None:
+            #     print(f"BM, BN: [{block_m}, {block_n}]; num_waves: {num_waves}; last_wave_util: {get_last_wave_util(block_m, block_n)}%")
     assert best_block_m is not None and best_block_n is not None
 
     # Always pick the longest one
@@ -105,10 +104,11 @@ def get_best_configs(m: int, n: int, k: int, num_groups: int, num_sms: int,
     assert best_num_stages is not None
 
     # Decide the number of TMA multicast
-    best_num_tma_multicast = 1
-    if m >= 1024 and is_tma_multicast_legal(n, best_block_n, 2, num_sms) and num_groups == 1:
-        best_num_tma_multicast = 2
+    best_num_tma_multicast = 2
+    # if m >= 1024 and is_tma_multicast_legal(n, best_block_n, 2, num_sms) and num_groups == 1:
+    #     best_num_tma_multicast = 2
 
+    # print(best_block_m, best_block_n, best_num_stages, best_num_tma_multicast, best_smem_size)
     return best_block_m, best_block_n, best_num_stages, best_num_tma_multicast, best_smem_size
 
 def k_grouped_gemm_dw_fp8_fp8_bf16_tn_contiguous(
@@ -144,7 +144,6 @@ def k_grouped_gemm_dw_fp8_fp8_bf16_tn_contiguous(
     num_groups, m_, n_ = out.shape
     num_groups_ = k_indices.numel()
 
-    print(f"[M,N,K,G]: [{m},{n},{k},{num_groups}]")
     # Type and shape checks
     assert m == m_ and k == k_ and n == n_ and num_groups == num_groups_
     assert k % 128 == 0 and k != 0
@@ -207,7 +206,7 @@ def per_tile_quant(A: torch.Tensor, gsize:int=128):
     if pad_n: A = F.pad(A, (0, pad_n), mode='constant', value=0)
 
     A_reshape = A.reshape(-1, gsize)
-    scale = A_reshape.abs().amax(dim=1, keepdim=True).to(torch.float32)
+    scale = A_reshape.abs().amax(dim=1, keepdim=True).to(torch.float32).div(448.)
 
     q_tensor = A_reshape.div(scale).to(torch.float8_e4m3fn).reshape(*A.shape)[:,:k]
     fq_tensor = A_reshape.div(scale).to(torch.float8_e4m3fn).to(torch.float).mul(scale).reshape(*A.shape)[:,:k]
@@ -240,10 +239,9 @@ def per_block_quant(B: torch.Tensor, block_size: tuple[int, int] = (128, 128)):
         .contiguous()
     )
 
-    scale = B_blocks.abs().amax(dim=(1, 2), keepdim=True).to(torch.float32)
+    scale = B_blocks.abs().amax(dim=(1, 2), keepdim=True).to(torch.float32).div(448.)
 
     q_tensor = B_blocks.div(scale).to(torch.float8_e4m3fn)
-
     fq_tensor = q_tensor.to(torch.float).mul(scale)
 
     q_tensor = (
@@ -283,28 +281,26 @@ def quant_input(a: torch.Tensor, b: torch.Tensor, k_indices: torch.Tensor, BLOCK
     n, _ = b.shape
 
     a_quant_list, a_scale_list, b_quant_list, b_scale_list = [], [], [], []
+    new_k_indices = []
 
     k_start = 0
     for k_size in k_indices.tolist():
         # Align the current group's k dimension to BLOCK_K
         aligned_k_size = (k_size + BLOCK_K - 1) // BLOCK_K * BLOCK_K
 
-        a_group = a[:, k_start:k_start + k_size]
-        b_group = b[:, k_start:k_start + k_size]
-
-        # Pad each group to align with BLOCK_K
-        if k_size < aligned_k_size:
-            a_group = F.pad(a_group, (0, aligned_k_size - k_size), value=0)
-            b_group = F.pad(b_group, (0, aligned_k_size - k_size), value=0)
+        pad_size = aligned_k_size - k_size
+        a_group = F.pad(a[:, k_start:k_start+k_size], (0, pad_size))
+        b_group = F.pad(b[:, k_start:k_start+k_size], (0, pad_size))
 
         # Quantize the aligned groups
         a_quant, a_scale, _ = per_tile_quant(a_group, gsize=BLOCK_K)
         b_quant, b_scale, _ = per_block_quant(b_group, block_size=(BLOCK_K, BLOCK_K))
 
-        a_quant_list.append(a_quant[:, :k_size])
+        a_quant_list.append(a_quant)
         a_scale_list.append(a_scale)
-        b_quant_list.append(b_quant[:, :k_size])
+        b_quant_list.append(b_quant)
         b_scale_list.append(b_scale)
+        new_k_indices.append(a_quant.shape[1])
 
         k_start += k_size
 
@@ -315,32 +311,66 @@ def quant_input(a: torch.Tensor, b: torch.Tensor, k_indices: torch.Tensor, BLOCK
     a_scale = torch.cat(a_scale_list, dim=1)  # [m, total_tiles]
     b_scale = torch.cat(b_scale_list, dim=1)  # [num_blocks, total_blocks]
 
-    return (a_quant, a_scale), (b_quant, b_scale)
+    return (a_quant, a_scale), (b_quant, b_scale), torch.tensor(new_k_indices, dtype=torch.int32, device='cuda')
 
 
 def get_bfloat16_ref(lhs: tuple[torch.Tensor, torch.Tensor], rhs: tuple[torch.Tensor, torch.Tensor], k_indices: torch.Tensor):
     # since fp8 matmul is not supported, we use bfloat16 matmul as reference
-    A, A_scale = lhs
-    B, B_scale = rhs
+    a, a_scale = lhs
+    b, b_scale = rhs
 
-    m, k = A.shape
-    n, k_ = B.shape
+    m, k = a.shape
+    n, k_ = b.shape
     num_groups = k_indices.numel()
 
-    assert A.dtype == torch.float8_e4m3fn and B.dtype == torch.float8_e4m3fn
-    assert A_scale.dtype == torch.float32 and B_scale.dtype == torch.float32
-    assert k == k_ and k == k_indices.sum().item()
+    BLOCK_K = 128
+    assert a.dtype == torch.float8_e4m3fn and b.dtype == torch.float8_e4m3fn
+    assert a_scale.dtype == torch.float32 and b_scale.dtype == torch.float32
+    assert k == k_ and k == k_indices.sum().item() and k % BLOCK_K == 0
 
-    out = torch.zeros(num_groups*m, n, dtype=torch.bfloat16, device='cuda')
-    for g in range(num_groups):
-        pass
+    assert n % BLOCK_K == 0, f"Assume n is multiple of {BLOCK_K} for now"
+
+    out = torch.zeros(num_groups, m, n, dtype=torch.bfloat16, device='cuda')
+    a_dequant = (
+        a
+        .reshape(-1, BLOCK_K)
+        .to(torch.float)
+        .mul(a_scale.reshape(-1, 1))
+        .reshape(m, k)
+        .to(torch.bfloat16)
+    )
+    b_dequant = (
+        b
+        .reshape(-1, BLOCK_K, k // BLOCK_K, BLOCK_K)
+        .transpose(1,2)
+        .to(torch.float)
+        .mul(b_scale.view(n//BLOCK_K, k//BLOCK_K, 1, 1))
+        .transpose(1,2)
+        .reshape(n, k)
+        .to(torch.bfloat16)
+    )
+    k_start = 0
+    for g, k_size in enumerate(k_indices.tolist()):
+        a_group = a_dequant[:, k_start:k_start + k_size]
+        b_group = b_dequant[:, k_start:k_start + k_size]
+        out[g] = a_group@b_group.t().to(out.dtype)
+        k_start += k_size
+
+    return out
 
 
 if __name__ == "__main__":
 
+    VERIFICATION = True
+    BENCHMARK = True
+
     # group, M, N, K
     TEST_SHAPES = [
-        (8, 4096, 4096, 4096),
+        (4, 7168, 4096, 8192),
+        (4, 2048, 7168, 8192),
+        (8, 7168, 4096, 4096),
+        (8, 4096, 7168, 4096),
+        # (1, 4096, 4096, 4096),
     ]
 
     for (G, M, N, K) in TEST_SHAPES:
@@ -349,11 +379,34 @@ if __name__ == "__main__":
         D = torch.zeros((G, M, N), device='cuda', dtype=torch.bfloat16)
         k_indices = torch.tensor([K] * G, dtype=torch.int32, device='cuda')
 
-        (A_quant, A_scale), (B_quant, B_scale) = quant_input(A, B, k_indices)
+        (A_quant, A_scale), (B_quant, B_scale), k_indices = quant_input(A, B, k_indices)
 
-        A_scale = torch.ones_like(A_scale)
-        B_scale = torch.ones_like(B_scale)
+        print(f"{'='*50} [G, M, N, K]={[G, M, N,K]} {'='*50}")
+        if VERIFICATION:
+            # print(A_quant.shape)
+            # print(A_scale.shape)
+            # print(B_quant.shape)
+            # print(B_scale.shape)
+            # A_scale = torch.ones_like(A_scale)
+            # B_scale = torch.ones_like(B_scale)
+            ref = get_bfloat16_ref((A_quant, A_scale), (B_quant, B_scale), k_indices)
+            k_grouped_gemm_dw_fp8_fp8_bf16_tn_contiguous((A_quant, A_scale), (B_quant, B_scale), D, k_indices)
+            if not torch.allclose(ref, D, atol=1, rtol=1e-1):
+                print(f">>> Verification failed!")
+                print(f"res:\n{D}")
+                print(f"ref:\n{ref}")
+            else:
+                print(f">>> Verification passed!")
 
-        k_grouped_gemm_dw_fp8_fp8_bf16_tn_contiguous((A_quant, A_scale), (B_quant, B_scale), D, k_indices)
-
-        print(D)
+        st = torch.cuda.Event(enable_timing=True)
+        ed = torch.cuda.Event(enable_timing=True)
+        TEST_ITERS = 20
+        cost = []
+        for _ in range(TEST_ITERS):
+            st.record()
+            k_grouped_gemm_dw_fp8_fp8_bf16_tn_contiguous((A_quant, A_scale), (B_quant, B_scale), D, k_indices)
+            ed.record()
+            torch.cuda.synchronize()
+            cost.append(st.elapsed_time(ed))
+        median = sorted(cost)[TEST_ITERS//2]
+        print(f">>> time cost: {median:.3f} ms; TFLOPS: {G*M*N*K*2/median/1e9:.4f}")
